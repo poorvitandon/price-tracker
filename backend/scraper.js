@@ -1,739 +1,561 @@
-const { chromium } = require("playwright");
+/**
+ * backend/scraper.js
+ *
+ * Product Price Tracker — reliable scraper for https://demo.inelabteamdev.com/
+ *
+ * Fixes applied vs the previous version:
+ *  - Handles the DELAYED cookie overlay before every interaction (hover, click),
+ *    not just once after page load.
+ *  - Never lets the cookie overlay block priceBlock.hover() or Reveal Price click;
+ *    retries the action after re-dismissing the overlay.
+ *  - Captures the real /api/products/{id}/price network response and uses it as the
+ *    primary price/stock source; DOM regex extraction (original rupee logic) is a fallback.
+ *  - Logs every price API attempt (attemptNumber, httpStatus, timestamp) and derives
+ *    success / retrying / failed per attempt, honestly, never hiding failures.
+ *  - Never fabricates a price. Price history is only saved when a valid finite number
+ *    was actually extracted.
+ *  - Retries the whole interaction flow (fresh page) up to MAX_FLOW_ATTEMPTS times on
+ *    structural failures (e.g. reveal button never became clickable).
+ *  - Guards every wait/interaction against "Target page, context or browser has been
+ *    closed" by checking page.isClosed() first.
+ *  - Works headed locally (HEADLESS unset) and headless on Render (HEADLESS=true).
+ *
+ * Usage:
+ *   node scraper.js [productId]        // standalone / headed demo run
+ *   require('./scraper').scrapeProduct(productId)   // used by routes/cron
+ */
 
+require("dotenv").config();
+const { chromium } = require("playwright");
 const {
   saveTrackedProduct,
   savePriceHistory,
   saveScrapeLog,
 } = require("./services/databaseService");
 
-const PRODUCT_ID = process.argv[2] || 224;
-
-// Deployment: HEADLESS=true
-// Local: default headed mode
+const STORE_BASE_URL = "https://demo.inelabteamdev.com";
 const HEADLESS = process.env.HEADLESS === "true";
 
-// --------------------------------------------------
-// COOKIE HANDLER
-// --------------------------------------------------
+const MAX_FLOW_ATTEMPTS = 3; // full page-load-to-reveal retries
+const PRICE_API_WAIT_TIMEOUT_MS = 25000; // wait for a captured price API response
+const DOM_FALLBACK_WAIT_MS = 10000;
+const COOKIE_OVERLAY_POLL_MS = 500;
+const MOUSE_MOVEMENTS = 12;
+const DWELL_TIME_MS = 1000;
 
-async function acceptCookies(page) {
+// ---------------------------------------------------------------------------
+// Small safe helpers
+// ---------------------------------------------------------------------------
+
+function isPageAlive(page) {
   try {
-    if (page.isClosed()) return false;
+    return !!page && !page.isClosed();
+  } catch (e) {
+    return false;
+  }
+}
 
-    const cookieOverlay = page.locator(".cookie-overlay");
+async function safeWait(page, ms) {
+  if (!isPageAlive(page)) return;
+  try {
+    await page.waitForTimeout(ms);
+  } catch (err) {
+    if (!/closed/i.test(err.message || "")) throw err;
+  }
+}
 
-    if ((await cookieOverlay.count()) === 0) {
-      return false;
+// ---------------------------------------------------------------------------
+// Cookie overlay handling
+// ---------------------------------------------------------------------------
+
+/**
+ * Polls for the (possibly delayed) cookie overlay and clicks ACCEPT if present.
+ * Returns true if no overlay is blocking after this call, false if it never
+ * cleared within the timeout (caller decides whether that's fatal).
+ */
+async function dismissCookieOverlay(page, { timeout = 15000 } = {}) {
+  const deadline = Date.now() + timeout;
+
+  while (Date.now() < deadline) {
+    if (!isPageAlive(page)) return false;
+
+    const overlay = page.locator(".cookie-overlay").first();
+    let visible = false;
+    try {
+      visible = await overlay.isVisible();
+    } catch (e) {
+      visible = false;
     }
 
-    if (!(await cookieOverlay.isVisible().catch(() => false))) {
-      return false;
+    if (!visible) {
+      return true; // nothing blocking right now
     }
 
     console.log("Cookie overlay detected.");
+    const buttons = overlay.locator("button");
+    const count = await buttons.count().catch(() => 0);
+    console.log(`Cookie buttons found: ${count}`);
 
-    const buttons = cookieOverlay.locator("button");
-    const count = await buttons.count();
-
-    console.log("Cookie buttons found:", count);
-
+    let clicked = false;
     for (let i = 0; i < count; i++) {
-      const button = buttons.nth(i);
-
-      if (await button.isVisible().catch(() => false)) {
-        console.log(
-          "Accepting cookie:",
-          await button.innerText().catch(() => "ACCEPT")
-        );
-
-        await button.click({
-          force: true,
-          timeout: 5000,
-        });
-
-        console.log("Cookie accepted and closed.");
-
-        // Do NOT wait here.
-        // The store may update/re-render after accepting cookies.
-
-        return true;
+      const btn = buttons.nth(i);
+      const text = (await btn.innerText().catch(() => "")).trim();
+      if (/accept/i.test(text)) {
+        console.log(`Accepting cookie: ${text}`);
+        try {
+          await btn.click({ timeout: 3000 });
+          clicked = true;
+          break;
+        } catch (e) {
+          /* try next candidate */
+        }
+      }
+    }
+    if (!clicked && count > 0) {
+      try {
+        await buttons.first().click({ timeout: 3000 });
+        clicked = true;
+      } catch (e) {
+        /* fall through to poll again */
       }
     }
 
-    return false;
-  } catch (error) {
-    console.log("Cookie handling error:", error.message);
-    return false;
+    try {
+      await overlay.waitFor({ state: "hidden", timeout: 5000 });
+      console.log("Cookie accepted and closed.");
+      return true;
+    } catch (e) {
+      // overlay still there (or re-appeared) — loop and try again
+    }
+
+    await safeWait(page, COOKIE_OVERLAY_POLL_MS);
   }
+
+  return false;
 }
 
-// --------------------------------------------------
-// EXTRACT VALUE FROM API RESPONSE
-// --------------------------------------------------
-
-function findValue(obj, possibleKeys) {
-  if (!obj || typeof obj !== "object") {
-    return null;
-  }
-
-  for (const key of possibleKeys) {
-    if (
-      Object.prototype.hasOwnProperty.call(obj, key) &&
-      obj[key] !== null &&
-      obj[key] !== undefined
-    ) {
-      return obj[key];
+/**
+ * Runs actionFn(), and if it fails because the cookie overlay intercepted the
+ * pointer event (or a plain timeout that looks overlay-related), re-dismisses
+ * the overlay and retries. Never retries once the page/context is closed.
+ */
+async function withCookieRetry(page, actionFn, description, maxRetries = 3) {
+  let lastErr;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    if (!isPageAlive(page)) {
+      throw new Error(`Page closed before "${description}"`);
     }
-  }
-
-  for (const value of Object.values(obj)) {
-    if (value && typeof value === "object") {
-      const found = findValue(value, possibleKeys);
-
-      if (found !== null && found !== undefined) {
-        return found;
+    try {
+      await dismissCookieOverlay(page, { timeout: 4000 });
+      await actionFn();
+      return;
+    } catch (err) {
+      lastErr = err;
+      const msg = (err && err.message) || "";
+      if (/closed/i.test(msg)) throw err; // don't retry a dead page/context/browser
+      console.log(
+        `"${description}" failed (attempt ${attempt}/${maxRetries}): ${
+          msg.split("\n")[0]
+        }`
+      );
+      if (/cookie-overlay|intercepts pointer events|Timeout/i.test(msg)) {
+        await dismissCookieOverlay(page, { timeout: 8000 });
       }
+      await safeWait(page, 500);
     }
   }
+  throw lastErr || new Error(`"${description}" failed after ${maxRetries} attempts`);
+}
 
+// ---------------------------------------------------------------------------
+// Human-like interaction
+// ---------------------------------------------------------------------------
+
+async function humanHover(page, locator) {
+  const box = await locator.boundingBox();
+  if (!box) throw new Error("Price block bounding box not found");
+
+  const cx = box.x + box.width / 2;
+  const cy = box.y + box.height / 2;
+
+  for (let i = 0; i < MOUSE_MOVEMENTS; i++) {
+    const dx = cx + (Math.random() * 40 - 20);
+    const dy = cy + (Math.random() * 20 - 10);
+    await page.mouse.move(dx, dy, { steps: 5 });
+    await safeWait(page, 40 + Math.random() * 60);
+  }
+  await page.mouse.move(cx, cy, { steps: 5 });
+  await safeWait(page, DWELL_TIME_MS);
+}
+
+// ---------------------------------------------------------------------------
+// Price / stock extraction
+// ---------------------------------------------------------------------------
+
+// Original DOM extraction logic — preserved as-is (fallback only).
+function extractPriceFromText(text) {
+  const prices = text.match(/₹[\d,\u200b]+/g) || [];
+  const cleanPrice = (value) => value.replace(/[₹,\u200b\u200c\u200d\ufeff]/g, "");
+  const numericPrices = prices.map(cleanPrice).filter((value) => /^\d+$/.test(value));
+  const currentPrice =
+    numericPrices.length >= 2
+      ? numericPrices[1]
+      : numericPrices.length === 1
+        ? numericPrices[0]
+        : null;
+  return currentPrice;
+}
+
+function extractStockFromDom(text) {
+  const match = text.match(/in stock|out of stock|low stock/i);
+  return match ? match[0].toLowerCase() : null;
+}
+
+// Parse the real API payload defensively — no invented structure, just common shapes.
+function extractPriceFromApiPayload(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const candidates = [
+    payload.price,
+    payload.currentPrice,
+    payload.salePrice,
+    payload?.data?.price,
+    payload?.data?.currentPrice,
+    payload?.product?.price,
+  ];
+  for (const c of candidates) {
+    if (c === undefined || c === null) continue;
+    const n = typeof c === "string" ? Number(c.replace(/[₹,\s]/g, "")) : Number(c);
+    if (Number.isFinite(n)) return n;
+  }
   return null;
 }
 
-// --------------------------------------------------
-// MAIN SCRAPER
-// --------------------------------------------------
-
-async function scrapeProduct(productId) {
-  const browser = await chromium.launch({
-    headless: HEADLESS,
-  });
-
-  const page = await browser.newPage();
-
-  // Store price API attempts
-  const priceAttempts = [];
-
-  // Actual successful price API response
-  let apiPriceData = null;
-
-  // --------------------------------------------------
-  // NETWORK LOGGING
-  // --------------------------------------------------
-
-  page.on("request", (request) => {
-    if (
-      request.resourceType() === "fetch" ||
-      request.resourceType() === "xhr"
-    ) {
-      console.log(
-        ">> REQUEST:",
-        request.method(),
-        request.url()
-      );
-    }
-  });
-
-  page.on("response", async (response) => {
-    const url = response.url();
-
-    if (
-      response.request().resourceType() === "fetch" ||
-      response.request().resourceType() === "xhr"
-    ) {
-      console.log(
-        "<< RESPONSE:",
-        response.status(),
-        url
-      );
-    }
-
-    // --------------------------------------------------
-    // CAPTURE ACTUAL PRODUCT PRICE API
-    // --------------------------------------------------
-
-    if (url.includes(`/api/products/${productId}/price`)) {
-      const status = response.status();
-
-      const attemptNumber = priceAttempts.length + 1;
-
-      priceAttempts.push({
-        attemptNumber,
-        httpStatus: status,
-        timestamp: new Date(),
-      });
-
-      console.log(
-        `PRICE ATTEMPT ${attemptNumber}: HTTP ${status}`
-      );
-
-      // Capture successful API response
-      if (status === 200) {
-        try {
-          const body = await response.json();
-
-          apiPriceData = body;
-
-          console.log(
-            "PRICE API RESPONSE RECEIVED."
-          );
-
-          console.log(
-            "PRICE API DATA:",
-            JSON.stringify(body)
-          );
-        } catch (error) {
-          console.log(
-            "Could not parse price API response:",
-            error.message
-          );
-        }
-      }
-    }
-  });
-
-  try {
-    console.log(
-      `Opening product ${productId}...`
-    );
-
-    // --------------------------------------------------
-    // STEP 1: OPEN PRODUCT
-    // --------------------------------------------------
-
-    await page.goto(
-      `https://demo.inelabteamdev.com/product/${productId}`,
-      {
-        waitUntil: "domcontentloaded",
-        timeout: 30000,
-      }
-    );
-
-    console.log("Page loaded.");
-
-    await page.waitForTimeout(1500);
-
-    // Cookie can appear slightly after page load
-    await acceptCookies(page);
-
-    // --------------------------------------------------
-    // STEP 2: FIND PRICE AREA
-    // --------------------------------------------------
-
-    console.log(
-      "Moving mouse over price area..."
-    );
-
-    const priceBlock =
-      page.locator(".price-block").first();
-
-    await priceBlock.waitFor({
-      state: "visible",
-      timeout: 10000,
-    });
-
-    const box =
-      await priceBlock.boundingBox();
-
-    if (!box) {
-      throw new Error(
-        "Could not find price block coordinates"
-      );
-    }
-
-    console.log(
-      "Price area:",
-      box
-    );
-
-    // --------------------------------------------------
-    // STEP 3: HUMAN-LIKE MOUSE MOVEMENT
-    // --------------------------------------------------
-
-    // Cookie may appear after initial page load
-    await acceptCookies(page);
-
-    await priceBlock.hover();
-
-    await page.waitForTimeout(200);
-
-    for (let i = 0; i < 12; i++) {
-      await priceBlock.hover({
-        position: {
-          x: 20 + (i % 4) * 40,
-          y: 20 + (i % 3) * 15,
-        },
-      });
-
-      await page.waitForTimeout(120);
-    }
-
-    // Required dwell time
-    await page.waitForTimeout(1000);
-
-    // Cookie can appear again
-    await acceptCookies(page);
-
-    // --------------------------------------------------
-    // STEP 4: REVEAL PRICE
-    // --------------------------------------------------
-
-    console.log(
-      "Looking for Reveal price button..."
-    );
-
-    const revealButton =
-      page.getByRole("button", {
-        name: /reveal price/i,
-      });
-
-    await revealButton.waitFor({
-      state: "visible",
-      timeout: 10000,
-    });
-
-    const disabled =
-      await revealButton.isDisabled();
-
-    console.log(
-      "Button disabled state:",
-      disabled
-    );
-
-    if (disabled) {
-      throw new Error(
-        "Reveal button is still disabled after mouse interaction"
-      );
-    }
-
-    console.log(
-      "Reveal price button is enabled."
-    );
-
-    // Cookie protection one final time
-    await acceptCookies(page);
-
-    await revealButton.click({
-      force: true,
-      timeout: 10000,
-    });
-
-    console.log(
-      "Reveal price clicked."
-    );
-
-    // --------------------------------------------------
-    // STEP 5: WAIT FOR PRICE API
-    // --------------------------------------------------
-
-    console.log(
-      "Waiting for price API response..."
-    );
-
-    // The actual source of truth is the price API,
-    // not .price-main DOM rendering.
-    const apiDeadline =
-      Date.now() + 60000;
-
-    while (
-      !apiPriceData &&
-      Date.now() < apiDeadline
-    ) {
-      await new Promise((resolve) =>
-        setTimeout(resolve, 500)
-      );
-    }
-
-    // --------------------------------------------------
-    // STEP 6: EXTRACT RESULT
-    // --------------------------------------------------
-
-    let result = {
-      name: null,
-      price: null,
-      stock: null,
-    };
-
-    // --------------------------------------------------
-    // FIRST: TRY API RESPONSE
-    // --------------------------------------------------
-
-    if (apiPriceData) {
-      console.log(
-        "Extracting price from API response..."
-      );
-
-      const apiPrice = findValue(
-        apiPriceData,
-        [
-          "price",
-          "currentPrice",
-          "sellingPrice",
-          "salePrice",
-          "finalPrice",
-          "amount",
-        ]
-      );
-
-      const apiStock = findValue(
-        apiPriceData,
-        [
-          "stock",
-          "stockStatus",
-          "availability",
-          "inventory",
-          "quantity",
-        ]
-      );
-
-      const apiName = findValue(
-        apiPriceData,
-        [
-          "name",
-          "productName",
-          "title",
-        ]
-      );
-
-      if (
-        apiPrice !== null &&
-        apiPrice !== undefined
-      ) {
-        result.price =
-          String(apiPrice)
-            .replace(/[₹,\u200b\u200c\u200d\ufeff]/g, "")
-            .trim();
-      }
-
-      if (
-        apiStock !== null &&
-        apiStock !== undefined
-      ) {
-        result.stock =
-          String(apiStock).trim();
-      }
-
-      if (
-        apiName !== null &&
-        apiName !== undefined
-      ) {
-        result.name =
-          String(apiName).trim();
-      }
-    }
-
-    // --------------------------------------------------
-    // SECOND: DOM FALLBACK
-    // --------------------------------------------------
-
-    if (
-      result.price === null ||
-      result.price === undefined ||
-      result.price === ""
-    ) {
-      console.log(
-        "API price not directly detected. Trying DOM fallback..."
-      );
-
-      try {
-        result = await page.evaluate(
-          () => {
-            const priceMain =
-              document.querySelector(
-                ".price-main"
-              );
-
-            let currentPrice = null;
-
-            if (priceMain) {
-              const text =
-                priceMain.innerText || "";
-
-              const prices =
-                text.match(
-                  /₹[\d,\u200b]+/g
-                ) || [];
-
-              const cleanPrice =
-                (value) =>
-                  value.replace(
-                    /[₹,\u200b\u200c\u200d\ufeff]/g,
-                    ""
-                  );
-
-              const numericPrices =
-                prices
-                  .map(cleanPrice)
-                  .filter(
-                    (value) =>
-                      /^\d+$/.test(value)
-                  );
-
-              console.log(
-                "Detected prices:",
-                numericPrices
-              );
-
-              currentPrice =
-                numericPrices.length >= 2
-                  ? numericPrices[1]
-                  : numericPrices.length === 1
-                    ? numericPrices[0]
-                    : null;
-            }
-
-            const stockElement =
-              document.querySelector(
-                ".stock-badge"
-              ) ||
-              document.querySelector(
-                ".stock"
-              );
-
-            const stock =
-              stockElement?.innerText?.trim() ||
-              null;
-
-            const name =
-              document
-                .querySelector("h1")
-                ?.innerText?.trim() ||
-                null;
-
-            return {
-              name,
-              price: currentPrice,
-              stock,
-            };
-          }
-        );
-      } catch (error) {
-        console.log(
-          "DOM fallback failed:",
-          error.message
-        );
-      }
-    } else {
-      // Fill missing fields from DOM
-      try {
-        const domInfo =
-          await page.evaluate(() => ({
-            name:
-              document
-                .querySelector("h1")
-                ?.innerText?.trim() ||
-              null,
-
-            stock:
-              document
-                .querySelector(".stock-badge")
-                ?.innerText?.trim() ||
-              document
-                .querySelector(".stock")
-                ?.innerText?.trim() ||
-              null,
-          }));
-
-        if (!result.name) {
-          result.name =
-            domInfo.name;
-        }
-
-        if (!result.stock) {
-          result.stock =
-            domInfo.stock;
-        }
-      } catch (error) {
-        console.log(
-          "Could not read DOM metadata:",
-          error.message
-        );
-      }
-    }
-
-    console.log(
-      "\nSCRAPE RESULT:"
-    );
-
-    console.log(result);
-
-    // --------------------------------------------------
-    // VALIDATE PRICE
-    // --------------------------------------------------
-
-    const priceNumber =
-      result.price !== null &&
-      result.price !== undefined &&
-      result.price !== ""
-        ? Number(result.price)
-        : null;
-
-    console.log(
-      "\nNumeric price:",
-      priceNumber
-    );
-
-    if (
-      priceNumber === null ||
-      !Number.isFinite(priceNumber)
-    ) {
-      throw new Error(
-        "Price API succeeded but price could not be extracted."
-      );
-    }
-
-    // --------------------------------------------------
-    // STEP 7: SAVE TRACKED PRODUCT
-    // --------------------------------------------------
-
-    console.log(
-      "\nSaving result to Supabase..."
-    );
-
-    const trackedProduct =
-      await saveTrackedProduct({
-        productId,
-        productName:
-          result.name ||
-          `Product ${productId}`,
-      });
-
-    console.log(
-      "Tracked product saved:",
-      trackedProduct.id
-    );
-
-    // --------------------------------------------------
-    // STEP 8: SAVE PRICE HISTORY
-    // --------------------------------------------------
-
-    const priceHistory =
-      await savePriceHistory({
-        trackedProductId:
-          trackedProduct.id,
-        price: priceNumber,
-        stockStatus: result.stock,
-      });
-
-    console.log(
-      "Price history saved:",
-      priceHistory.id
-    );
-
-    // --------------------------------------------------
-    // STEP 9: SAVE EVERY PRICE ATTEMPT
-    // --------------------------------------------------
-
-    console.log(
-      "\nSaving scrape attempts..."
-    );
-
-    const hasSuccessfulAttempt =
-      priceAttempts.some(
-        (attempt) =>
-          attempt.httpStatus === 200
-      );
-
-    for (const attempt of priceAttempts) {
-      let status;
-
-      if (
-        attempt.httpStatus === 200
-      ) {
-        status = "success";
-      } else {
-        status =
-          hasSuccessfulAttempt
-            ? "retrying"
-            : "failed";
-      }
-
-      await saveScrapeLog({
-        trackedProductId:
-          trackedProduct.id,
-
-        attemptNumber:
-          attempt.attemptNumber,
-
-        status,
-
-        httpStatus:
-          attempt.httpStatus,
-
-        errorMessage:
-          attempt.httpStatus === 200
-            ? null
-            : `Price API returned HTTP ${attempt.httpStatus}`,
-
-        startedAt:
-          attempt.timestamp,
-
-        completedAt:
-          new Date(),
-      });
-
-      console.log(
-        `Attempt ${attempt.attemptNumber}: ${attempt.httpStatus} → ${status}`
-      );
-    }
-
-    console.log(
-      "Scrape logs saved."
-    );
-
-    // --------------------------------------------------
-    // FINAL RESULT
-    // --------------------------------------------------
-
-    return {
-      success: true,
-      productId,
-      productName:
-        result.name ||
-        `Product ${productId}`,
-      price: priceNumber,
-      stock: result.stock,
-      attempts:
-        priceAttempts.length,
-      trackedProductId:
-        trackedProduct.id,
-    };
-
-  } catch (error) {
-    console.error(
-      "\nSCRAPE FAILED:"
-    );
-
-    console.error(
-      error.message
-    );
-
-    throw error;
-
-  } finally {
-    await browser.close();
+function extractStockFromApiPayload(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const candidates = [
+    payload.stock,
+    payload.stockStatus,
+    payload.stock_status,
+    payload?.data?.stock,
+    payload?.data?.stockStatus,
+    payload?.product?.stock,
+  ];
+  for (const c of candidates) {
+    if (typeof c === "string" && c.trim()) return c.trim().toLowerCase();
+    if (typeof c === "boolean") return c ? "in_stock" : "out_of_stock";
   }
+  return null;
 }
 
-// --------------------------------------------------
-// DIRECT SCRIPT EXECUTION
-// --------------------------------------------------
+// ---------------------------------------------------------------------------
+// Network capture — every hit to the real price API is logged
+// ---------------------------------------------------------------------------
+
+function attachPriceApiListener(page, priceAttempts) {
+  page.on("response", async (response) => {
+    try {
+      const url = response.url();
+      if (!/\/api\/products\/[^/]+\/price/.test(url)) return;
+
+      const status = response.status();
+      let payload = null;
+      if (status === 200) {
+        try {
+          payload = await response.json();
+        } catch (e) {
+          payload = null;
+        }
+      }
+
+      priceAttempts.push({
+        attemptNumber: priceAttempts.length + 1,
+        httpStatus: status,
+        timestamp: new Date().toISOString(),
+        url,
+        payload,
+      });
+      console.log(`PRICE ATTEMPT ${priceAttempts.length}: HTTP ${status}`);
+    } catch (e) {
+      // never let a listener error kill the scrape
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// One full interaction flow (page load -> reveal -> extract)
+// ---------------------------------------------------------------------------
+
+async function runFlow(page, productId, priceAttempts) {
+  const url = `${STORE_BASE_URL}/product/${productId}`;
+  console.log(`Navigating to ${url}`);
+  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+
+  // Cookie overlay can appear immediately or after a delay — check now, and
+  // again before every subsequent interaction via withCookieRetry.
+  await dismissCookieOverlay(page);
+
+  await safeWait(page, 1500); // let layout/content settle
+
+  const productName = await page
+    .locator("h1")
+    .first()
+    .innerText({ timeout: 5000 })
+    .catch(() => null);
+
+  const priceBlock = page.locator(".price-block").first();
+  await priceBlock.waitFor({ state: "visible", timeout: 15000 });
+
+  await withCookieRetry(
+    page,
+    async () => humanHover(page, priceBlock),
+    "Hover over price block"
+  );
+
+  const revealBtn = page
+    .locator('button[aria-label="Reveal price"], button:has-text("Reveal price")')
+    .first();
+  await revealBtn.waitFor({ state: "visible", timeout: 15000 });
+
+  const isEnabled = await revealBtn.isEnabled().catch(() => false);
+  if (!isEnabled) throw new Error("Reveal price button not enabled");
+
+  await withCookieRetry(
+    page,
+    async () => revealBtn.click({ timeout: 5000 }),
+    "Click Reveal price"
+  );
+
+  console.log("Reveal price clicked, waiting for price API response...");
+
+  const attemptsBefore = priceAttempts.length;
+  const deadline = Date.now() + PRICE_API_WAIT_TIMEOUT_MS;
+  let apiPrice = null;
+  let apiStock = null;
+  let sawApiSuccess = false;
+
+  while (Date.now() < deadline) {
+    if (!isPageAlive(page)) throw new Error("Page closed while waiting for price API");
+    const successAttempt = priceAttempts
+      .slice(attemptsBefore)
+      .find((a) => a.httpStatus === 200 && a.payload);
+    if (successAttempt) {
+      apiPrice = extractPriceFromApiPayload(successAttempt.payload);
+      apiStock = extractStockFromApiPayload(successAttempt.payload);
+      sawApiSuccess = true;
+      break;
+    }
+    await safeWait(page, 300);
+  }
+
+  let finalPrice = apiPrice;
+  let finalStock = apiStock;
+  let source = "api";
+
+  // Fall back to DOM extraction only if the API path didn't give us a usable price.
+  if (!Number.isFinite(finalPrice)) {
+    source = "dom";
+    console.log("API price unavailable/unparseable — falling back to DOM extraction.");
+    try {
+      await page.waitForFunction(
+        () => {
+          const text = document.body.innerText || "";
+          const prices = text.match(/₹[\d,\u200b]+/g) || [];
+          return prices.length >= 1;
+        },
+        { timeout: DOM_FALLBACK_WAIT_MS }
+      );
+    } catch (e) {
+      console.log("DOM price wait timed out — attempting extraction anyway.");
+    }
+
+    const bodyText = await page.locator("body").innerText().catch(() => "");
+    const domPriceStr = extractPriceFromText(bodyText);
+    finalPrice = domPriceStr !== null ? Number(domPriceStr) : null;
+    if (!finalStock) finalStock = extractStockFromDom(bodyText);
+  }
+
+  return {
+    productName: productName || `Product ${productId}`,
+    price: Number.isFinite(finalPrice) ? finalPrice : null,
+    stock: finalStock || null,
+    priceSource: source,
+    apiObservedSuccess: sawApiSuccess,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Top-level scrape orchestration
+// ---------------------------------------------------------------------------
+
+async function scrapeProduct(productId, options = {}) {
+  const headless = options.headless !== undefined ? options.headless : HEADLESS;
+  console.log(`\n=== Starting scrape for product ${productId} (headless=${headless}) ===`);
+
+  const startedAt = new Date().toISOString();
+  const priceAttempts = [];
+  let browser, context, page;
+  let flowError = null;
+  let result = null;
+
+  try {
+    browser = await chromium.launch({ headless });
+    context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+
+    for (let flowAttempt = 1; flowAttempt <= MAX_FLOW_ATTEMPTS; flowAttempt++) {
+      try {
+        if (page && !page.isClosed()) await page.close().catch(() => {});
+        page = await context.newPage();
+        attachPriceApiListener(page, priceAttempts);
+
+        result = await runFlow(page, productId, priceAttempts);
+
+        if (Number.isFinite(result.price)) {
+          flowError = null;
+          break;
+        }
+        throw new Error("Flow completed but no valid numeric price was extracted");
+      } catch (err) {
+        flowError = err;
+        console.log(`Flow attempt ${flowAttempt}/${MAX_FLOW_ATTEMPTS} failed: ${err.message}`);
+        if (flowAttempt < MAX_FLOW_ATTEMPTS) {
+          console.log("Retrying full scrape flow with a fresh page...");
+          await safeWait(page, 1000);
+        }
+      }
+    }
+  } finally {
+    try {
+      if (page && !page.isClosed()) await page.close();
+    } catch (e) {}
+    try {
+      if (context) await context.close();
+    } catch (e) {}
+    try {
+      if (browser) await browser.close();
+    } catch (e) {}
+  }
+
+  const completedAt = new Date().toISOString();
+  const success = !!(result && Number.isFinite(result.price));
+
+  // Derive per-attempt status: 200 = success; non-200 before an eventual success = retrying;
+  // non-200 with no later success = failed. Never hide a failed attempt.
+  const firstSuccessIndex = priceAttempts.findIndex((a) => a.httpStatus === 200);
+  const attemptLogs = priceAttempts.map((a, idx) => {
+    let status;
+    if (a.httpStatus === 200) status = "success";
+    else if (firstSuccessIndex !== -1 && idx < firstSuccessIndex) status = "retrying";
+    else status = "failed";
+    return {
+      attempt_number: a.attemptNumber,
+      status,
+      http_status: a.httpStatus,
+      error_message: a.httpStatus === 200 ? null : `Price API returned HTTP ${a.httpStatus}`,
+      started_at: a.timestamp,
+      completed_at: a.timestamp,
+    };
+  });
+
+  // If the flow failed before any price API call was ever observed (e.g. cookie
+  // overlay never cleared, reveal button never appeared), still log honestly.
+  if (attemptLogs.length === 0) {
+    attemptLogs.push({
+      attempt_number: 1,
+      status: "failed",
+      http_status: null,
+      error_message: flowError ? flowError.message : "Unknown scraping failure",
+      started_at: startedAt,
+      completed_at: completedAt,
+    });
+  } else if (!success && flowError) {
+    attemptLogs.push({
+      attempt_number: attemptLogs.length + 1,
+      status: "failed",
+      http_status: null,
+      error_message: flowError.message,
+      started_at: startedAt,
+      completed_at: completedAt,
+    });
+  }
+
+  // Persist tracked product (upsert by product_id — existing behaviour preserved).
+  let trackedProduct = null;
+  try {
+    trackedProduct = await saveTrackedProduct({
+      product_id: String(productId),
+      product_name: result ? result.productName : `Product ${productId}`,
+      is_active: true,
+    });
+  } catch (err) {
+    console.log(`Failed to save tracked product: ${err.message}`);
+  }
+
+  const trackedProductId =
+    trackedProduct &&
+    (trackedProduct.id ||
+      (Array.isArray(trackedProduct) && trackedProduct[0] && trackedProduct[0].id));
+
+  if (trackedProductId) {
+    for (const log of attemptLogs) {
+      try {
+        await saveScrapeLog({ tracked_product_id: trackedProductId, ...log });
+      } catch (err) {
+        console.log(`Failed to save scrape log: ${err.message}`);
+      }
+    }
+
+    if (success) {
+      try {
+        await savePriceHistory({
+          tracked_product_id: trackedProductId,
+          price: result.price,
+          stock_status: result.stock,
+        });
+        console.log(`Saved price history: price=${result.price} stock=${result.stock}`);
+      } catch (err) {
+        console.log(`Failed to save price history: ${err.message}`);
+      }
+    } else {
+      console.log(
+        "Scrape did not produce a valid price — price history NOT saved (honest failure)."
+      );
+    }
+  } else {
+    console.log("No trackedProductId available — skipping log/history persistence.");
+  }
+
+  const finalResult = {
+    productId: String(productId),
+    productName: result ? result.productName : null,
+    success,
+    price: success ? result.price : null,
+    stock: success ? result.stock : null,
+    priceSource: result ? result.priceSource : null,
+    priceAttempts: attemptLogs,
+    error: success ? null : flowError ? flowError.message : "Unknown failure",
+    startedAt,
+    completedAt,
+  };
+
+  console.log(`=== Scrape ${success ? "SUCCEEDED" : "FAILED"} for product ${productId} ===\n`);
+  return finalResult;
+}
+
+module.exports = { scrapeProduct };
+
+// ---------------------------------------------------------------------------
+// Standalone execution (npm run scrape / npm run scrape:headed)
+// ---------------------------------------------------------------------------
 
 if (require.main === module) {
-  scrapeProduct(PRODUCT_ID)
-    .then((result) => {
-      console.log(
-        "\nFINAL SCRAPE RESULT:"
-      );
-
-      console.log(result);
-
-      process.exit(0);
+  const targetProductId = process.env.PRODUCT_ID || process.argv[2] || "747";
+  scrapeProduct(targetProductId)
+    .then((res) => {
+      console.log(JSON.stringify(res, null, 2));
+      process.exit(res.success ? 0 : 1);
     })
-    .catch(() => {
+    .catch((err) => {
+      console.error("Fatal scraper error:", err);
       process.exit(1);
     });
 }
-
-module.exports = {
-  scrapeProduct,
-};
