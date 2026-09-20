@@ -15,48 +15,51 @@ const HEADLESS = process.env.HEADLESS === "true";
 async function acceptCookies(page) {
   const cookieOverlay = page.locator(".cookie-overlay");
 
-  if (await cookieOverlay.count() === 0) {
+  try {
+    if (await cookieOverlay.count() === 0) {
+      return false;
+    }
+
+    if (!(await cookieOverlay.isVisible().catch(() => false))) {
+      return false;
+    }
+
+    console.log("Cookie overlay detected.");
+
+    const acceptButton = cookieOverlay
+      .locator("button")
+      .filter({ hasText: /^ACCEPT$/i })
+      .first();
+
+    if (await acceptButton.count() === 0) {
+      console.log("ACCEPT button not found.");
+      return false;
+    }
+
+    console.log("Accepting cookie...");
+
+    await acceptButton.click({
+      force: true,
+      timeout: 5000,
+    });
+
+    console.log("Cookie accepted.");
+
+    // Give the overlay time to disappear, but don't
+    // wait on a page that may have been closed.
+    if (!page.isClosed()) {
+      await page.waitForTimeout(300);
+    }
+
+    return true;
+  } catch (error) {
+    if (page.isClosed()) {
+      throw error;
+    }
+
+    console.log("Cookie handling error:", error.message);
     return false;
   }
-
-  console.log("Cookie overlay detected.");
-
-  const buttons = cookieOverlay.locator("button");
-  const count = await buttons.count();
-
-  console.log("Cookie buttons found:", count);
-
-  for (let i = 0; i < count; i++) {
-    const button = buttons.nth(i);
-
-    if (await button.isVisible()) {
-      console.log(
-        "Accepting cookie:",
-        await button.innerText()
-      );
-
-      await button.click({
-        force: true,
-        timeout: 5000,
-      });
-
-      await page.waitForTimeout(500);
-
-      // Make sure overlay is gone
-      if (
-        await cookieOverlay.count() > 0 &&
-        await cookieOverlay.isVisible()
-      ) {
-        console.log("Cookie overlay still visible.");
-      } else {
-        console.log("Cookie overlay accepted and closed.");
-      }
-
-      return true;
-    }
-  }
-
-  return false;
 }
 
 async function scrapeProduct(productId) {
@@ -160,12 +163,14 @@ async function scrapeProduct(productId) {
     // --------------------------------------------------
     // STEP 3: HUMAN-LIKE MOUSE MOVEMENT
     // --------------------------------------------------
-
+await acceptCookies(page);
     await priceBlock.hover();
 
     await page.waitForTimeout(200);
 
     for (let i = 0; i < 12; i++) {
+
+       
       await priceBlock.hover({
         position: {
           x: 20 + (i % 4) * 40,
