@@ -1,7 +1,8 @@
 const express = require("express");
-const supabase = require("../db/supabase");
-
 const router = express.Router();
+require("dotenv").config();
+
+const supabase = require("../db/supabase");
 
 router.post("/scrape", async (req, res) => {
   try {
@@ -27,62 +28,61 @@ router.post("/scrape", async (req, res) => {
     }
 
     if (!products || products.length === 0) {
-      return res.json({
+      return res.status(200).json({
         success: true,
         message: "No active products to scrape",
         results: [],
       });
     }
 
-    const { scrapeProduct } = require("../scraper");
+    // Start scraping in background.
+    // Do not keep the cron HTTP request waiting.
+    setImmediate(async () => {
+      console.log(
+        `Starting background cron scrape for ${products.length} product(s)...`
+      );
 
-    const results = [];
+      const { scrapeProduct } = require("../scraper");
 
-    for (const product of products) {
-      try {
-        console.log(
-          `Cron scraping: ${product.product_name} (${product.product_id})`
-        );
+      for (const product of products) {
+        try {
+          console.log(
+            `Starting cron scrape for product ${product.product_id}...`
+          );
 
-        const result = await scrapeProduct(
-          product.product_id
-        );
+          const result = await scrapeProduct(
+            product.product_id
+          );
 
-        results.push({
-          productId: product.product_id,
-          productName: product.product_name,
-          success: true,
-          result,
-        });
-
-      } catch (error) {
-        console.error(
-          `Cron scrape failed for ${product.product_name}:`,
-          error.message
-        );
-
-        results.push({
-          productId: product.product_id,
-          productName: product.product_name,
-          success: false,
-          error: error.message,
-        });
+          console.log(
+            `Cron scrape completed for product ${product.product_id}:`,
+            result
+          );
+        } catch (error) {
+          console.error(
+            `Cron scrape failed for product ${product.product_id}:`,
+            error.message
+          );
+        }
       }
-    }
 
-    res.json({
+      console.log("Background cron scraping completed.");
+    });
+
+    // Respond immediately so cron-job.org does not timeout.
+    return res.status(202).json({
       success: true,
-      message: "Cron scraping completed",
-      results,
+      message: "Scraping started in background",
+      productCount: products.length,
     });
 
   } catch (error) {
     console.error(
-      "Cron scrape error:",
+      "Cron endpoint error:",
       error.message
     );
 
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       message: "Cron scraping failed",
     });
