@@ -233,7 +233,7 @@ await acceptCookies(page);
         const prices =
           text.match(/₹[\d,\u200b]+/g) || [];
 
-        return prices.length >= 2;
+        return prices.length >= 1;
       },
       {
         timeout: 60000,
