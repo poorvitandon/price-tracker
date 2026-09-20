@@ -12,6 +12,53 @@ const PRODUCT_ID = process.argv[2] || 224;
 // For deployment, set HEADLESS=true.
 const HEADLESS = process.env.HEADLESS === "true";
 
+async function acceptCookies(page) {
+  const cookieOverlay = page.locator(".cookie-overlay");
+
+  if (await cookieOverlay.count() === 0) {
+    return false;
+  }
+
+  console.log("Cookie overlay detected.");
+
+  const buttons = cookieOverlay.locator("button");
+  const count = await buttons.count();
+
+  console.log("Cookie buttons found:", count);
+
+  for (let i = 0; i < count; i++) {
+    const button = buttons.nth(i);
+
+    if (await button.isVisible()) {
+      console.log(
+        "Accepting cookie:",
+        await button.innerText()
+      );
+
+      await button.click({
+        force: true,
+        timeout: 5000,
+      });
+
+      await page.waitForTimeout(500);
+
+      // Make sure overlay is gone
+      if (
+        await cookieOverlay.count() > 0 &&
+        await cookieOverlay.isVisible()
+      ) {
+        console.log("Cookie overlay still visible.");
+      } else {
+        console.log("Cookie overlay accepted and closed.");
+      }
+
+      return true;
+    }
+  }
+
+  return false;
+}
+
 async function scrapeProduct(productId) {
   const browser = await chromium.launch({
     headless: HEADLESS,
@@ -88,6 +135,7 @@ async function scrapeProduct(productId) {
 
     await page.waitForTimeout(2000);
 
+    await acceptCookies(page);
     // --------------------------------------------------
     // STEP 2: FIND PRICE AREA
     // --------------------------------------------------
@@ -130,6 +178,8 @@ async function scrapeProduct(productId) {
 
     // Required dwell time
     await page.waitForTimeout(1000);
+
+    await acceptCookies(page);
 
     // --------------------------------------------------
     // STEP 4: REVEAL PRICE
@@ -383,7 +433,7 @@ async function scrapeProduct(productId) {
     console.error(error.message);
 
     throw error;
-    
+
   } finally {
     await browser.close();
   }
